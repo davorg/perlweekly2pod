@@ -1,0 +1,101 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use feature 'say';
+
+use LWP::UserAgent;
+use Mojo::DOM;
+use JSON qw(encode_json decode_json);
+use File::Temp qw(tempfile);
+use File::Slurp qw(write_file);
+use IPC::System::Simple qw(system);
+use OpenAPI::Client::OpenAI;
+
+# Configuration
+my $openai_key   = $ENV{OPENAI_API_KEY}     or die "Missing OPENAI_API_KEY\n";
+my $eleven_key   = $ENV{ELEVENLABS_API_KEY} or die "Missing ELEVENLABS_API_KEY\n";
+my $voices = {
+    Alice => '21m00Tcm4TlvDq8ikWAM',  # Rachel (British female)
+    Bob   => 'ErXwobaYiN019PkySvjV',  # Antoni (British male)
+};
+
+# Argument check
+my $issue = shift @ARGV or die "Usage: $0 <issue_number>\n";
+
+# 1. Download the newsletter
+my $url = "https://perlweekly.com/archive/$issue.html";
+my $html = LWP::UserAgent->new->get($url)->decoded_content;
+die "Failed to fetch issue $issue ($url)\n" unless $html;
+
+# 2. Extract the textual content
+my $dom  = Mojo::DOM->new($html);
+my $body = $dom->at('body')->all_text;
+
+# 3. Generate podcast script via OpenAI
+my $client = OpenAPI::Client::OpenAI->new;
+
+my $prompt = <<"PROMPT";
+You are a podcast script writer. Convert this newsletter into a conversational script between two co-hosts named Alice and Bob. Alice is upbeat and clear; Bob is calm and witty. Make it a 2–3 minute summarisation suitable for a weekly tech podcast.
+
+Newsletter content:
+$body
+PROMPT
+
+my $tx = $client->createChatCompletion({
+    body => {
+        model       => 'gpt-4',
+        messages    => [
+            { role => 'system', content => 'You write engaging conversational scripts for tech podcasts.' },
+            { role => 'user',   content => $prompt },
+        ],
+        temperature => 0.7,
+    }
+});
+my $data = $tx->res->json;
+my $reply = $data->{choices}[0]{message}{content}
+    or die "Unexpected API response, no content found\n";
+
+# 4. Segment script into speakers
+my @script;
+while ($reply =~ /^([A-Z][a-z]+):\s*(.+?)(?=(?:\n[A-Z][a-z]+:|\z))/gms) {
+    my ($speaker, $text) = ($1, $2);
+    $text =~ s/\s+/ /g;
+    push @script, { speaker => $speaker, text => $text };
+}
+
+# 5. Generate audio via ElevenLabs
+my $ua = LWP::UserAgent->new;
+my @mp3s;
+
+foreach my $seg (@script) {
+    my $voice_id = $voices->{ $seg->{speaker} } or next;
+    say "Synthesising voice for $seg->{speaker}...";
+
+    my $res = $ua->post(
+        "https://api.elevenlabs.io/v1/text-to-speech/$voice_id",
+        'Content-Type' => 'application/json',
+        'xi-api-key'   => $eleven_key,
+        Content        => encode_json({
+            text           => $seg->{text},
+            model_id       => 'eleven_multilingual_v2',
+            voice_settings => { stability => 0.5, similarity_boost => 0.75 },
+        })
+    );
+    die "ElevenLabs TTS failed: " . $res->status_line . "\n"
+      unless $res->is_success;
+
+    my ($fh, $file) = tempfile(SUFFIX => '.mp3', UNLINK => 0);
+    binmode $fh;
+    print $fh $res->decoded_content;
+    close $fh;
+    push @mp3s, $file;
+}
+
+# 6. Concatenate MP3 segments
+write_file("segments.txt", map { "file '$_'\n" } @mp3s);
+system('ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', 'segments.txt',
+    '-c', 'copy', "perl-weekly-$issue.mp3"
+);
+
+say "\n✅ Podcast created: perl-weekly-$issue.mp3";
+
