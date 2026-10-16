@@ -46,7 +46,8 @@ PROMPT
 
 my $tx = $client->createChatCompletion({
   body => {
-    model       => 'gpt-4',
+    model       => 'gpt-6-luna',
+    reasoning_effort => 'none',
     messages    => [
       { role => 'system', content => 'You write engaging conversational scripts for tech podcasts.' },
       { role => 'user',   content => $prompt },
